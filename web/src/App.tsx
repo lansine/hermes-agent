@@ -528,13 +528,13 @@ export default function App() {
               className={cn(
                 "flex h-14 shrink-0 items-center gap-2",
                 "border-b border-current/20",
-                collapsed ? "lg:justify-center lg:px-0" : "px-4 justify-between",
+                collapsed ? "lg:px-3" : "px-4 justify-between",
               )}
             >
               <div
                 className={cn(
-                  "flex items-center gap-2",
-                  collapsed && "lg:hidden",
+                  "flex items-center gap-2 lg:transition-[opacity] lg:duration-200",
+                  collapsed ? "lg:opacity-0 lg:w-0 lg:overflow-hidden lg:pointer-events-none" : "lg:opacity-100",
                 )}
               >
                 <PluginSlot name="header-left" />
