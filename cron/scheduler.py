@@ -941,6 +941,39 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "Never combine [SILENT] with content — either report your "
         "findings normally, or say [SILENT] and nothing more.]\n\n"
     )
+
+    # Defense Line 4 (added 2026-05-27): when this cron job will be
+    # delivered to Feishu or Weixin, inject explicit formatting rules
+    # so the LLM never emits markdown tables (which Feishu degrades to
+    # raw |---|---| garbage and Weixin shows as literal pipes).
+    deliver_value = _normalize_deliver_value(job.get("deliver"))
+    delivery_targets = []
+    for part in deliver_value.split(","):
+        part = part.strip()
+        if not part or part in ("local", "origin"):
+            continue
+        platform_name = part.split(":", 1)[0].strip()
+        if platform_name and platform_name not in delivery_targets:
+            delivery_targets.append(platform_name)
+    chat_platforms = {"feishu", "weixin", "wecom", "dingtalk"}
+    risky_targets = [p for p in delivery_targets if p in chat_platforms]
+    if risky_targets:
+        targets_str = "/".join(risky_targets)
+        platform_hint = (
+            f"[RENDERING TARGET: {targets_str}] "
+            f"Your output will be delivered to {targets_str}. "
+            "Strictly DO NOT use markdown tables (`| col1 | col2 |` syntax) — "
+            "Feishu silently degrades them to raw `|---|---|` text, and Weixin "
+            "shows literal pipe characters. For tabular/comparison data, "
+            "ALWAYS use the key-value list format instead:\n"
+            "  **field_name**: value\n"
+            "  **field_name**: value\n"
+            "  (blank line between rows)\n"
+            "Other rules: use `**bold**` for sub-headings (not `##`/`###`), "
+            "use `-` for bullets (not `*`), keep messages ≤ 1500 chars.\n\n"
+        )
+        cron_hint = cron_hint + platform_hint
+
     prompt = cron_hint + prompt
     if skills is None:
         legacy = job.get("skill")
