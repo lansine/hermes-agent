@@ -546,6 +546,116 @@ def _coerce_required_int(value: Any, default: int, min_value: int = 0) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _rewrite_markdown_table_to_kv_list(text: str) -> str:
+    """Convert markdown tables in *text* to Feishu-friendly key-value lists.
+
+    Defense Line 3 (added 2026-05-27): Feishu's post-md renderer drops the
+    entire message to plain text when it contains any markdown table, exposing
+    raw `|---|---|` characters to the user.  Rather than degrade silently or
+    only warn, this rewriter detects standard markdown tables (header row +
+    separator row + N data rows) and rewrites each row as a "**field**: value"
+    paragraph, separating rows by a blank line.
+
+    Non-table content is preserved verbatim, including code-fenced blocks
+    (anything between ``` fences is skipped — pipes inside code stay literal).
+
+    Algorithm:
+      1) Walk lines, tracking whether we're inside a fenced code block.
+      2) Outside code: when we see a header `| a | b |` line followed by a
+         separator `|---|---|` line, collect contiguous body rows that also
+         start with `|`.  Convert the table into KV paragraphs.  Continue.
+      3) Anything else is appended verbatim.
+
+    Returns the rewritten string.  If no tables are detected the original
+    string is returned unchanged.
+    """
+    if "|" not in text:
+        return text
+
+    lines = text.replace("\r\n", "\n").split("\n")
+    out: List[str] = []
+    i = 0
+    n = len(lines)
+    in_code_block = False
+    table_separator_re = re.compile(r"^\s*\|[-:|\s]+\|\s*$")
+    rewrote_any = False
+
+    def _split_row(row: str) -> List[str]:
+        # Strip leading/trailing | then split, trimming whitespace.
+        stripped = row.strip()
+        if stripped.startswith("|"):
+            stripped = stripped[1:]
+        if stripped.endswith("|"):
+            stripped = stripped[:-1]
+        return [c.strip() for c in stripped.split("|")]
+
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+
+        # Fenced code block: pass through, never rewrite pipes inside.
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            out.append(line)
+            i += 1
+            continue
+        if in_code_block:
+            out.append(line)
+            i += 1
+            continue
+
+        # Detect markdown table: header row + separator row.
+        if (
+            stripped.startswith("|")
+            and stripped.endswith("|")
+            and i + 1 < n
+            and table_separator_re.match(lines[i + 1])
+        ):
+            headers = _split_row(line)
+            i += 2  # skip header + separator
+            # Collect body rows while they look like table rows.
+            while i < n and lines[i].strip().startswith("|") and lines[i].strip().endswith("|"):
+                cells = _split_row(lines[i])
+                # Pad/truncate cells to header count.
+                if len(cells) < len(headers):
+                    cells = cells + [""] * (len(headers) - len(cells))
+                elif len(cells) > len(headers):
+                    cells = cells[: len(headers)]
+                # Render one row as KV paragraph.
+                kv_lines: List[str] = []
+                for h, v in zip(headers, cells):
+                    h_clean = h.strip()
+                    v_clean = v.strip()
+                    if not h_clean and not v_clean:
+                        continue
+                    if h_clean and v_clean:
+                        kv_lines.append(f"**{h_clean}**：{v_clean}")
+                    elif v_clean:
+                        kv_lines.append(v_clean)
+                    else:
+                        kv_lines.append(f"**{h_clean}**：")
+                if kv_lines:
+                    out.append("\n".join(kv_lines))
+                    out.append("")  # blank line between rows
+                i += 1
+            # Drop trailing blank line if we added one and the table was last block
+            if out and out[-1] == "":
+                # keep at most one blank line
+                pass
+            rewrote_any = True
+            continue
+
+        out.append(line)
+        i += 1
+
+    if not rewrote_any:
+        return text
+    # Collapse 3+ consecutive blank lines down to 2 for tidier output.
+    rebuilt = "\n".join(out)
+    rebuilt = re.sub(r"\n{3,}", "\n\n", rebuilt)
+    return rebuilt
+
+
 def _build_markdown_post_payload(content: str) -> str:
     rows = _build_markdown_post_rows(content)
     return json.dumps(
@@ -4224,9 +4334,45 @@ class FeishuAdapter(BasePlatformAdapter):
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
         # Feishu post-type 'md' elements do not render markdown tables; sending
         # table content as post causes the message to appear blank on the client.
-        # Force plain text for anything that looks like a markdown table.
         if _MARKDOWN_TABLE_RE.search(content):
-            text_payload = {"text": content}
+            # Defense Line 3 (added 2026-05-27): try to auto-rewrite the table
+            # into a key-value list so the user sees properly-formatted content
+            # instead of raw |---|---| garbage.
+            rewritten = _rewrite_markdown_table_to_kv_list(content)
+            if rewritten != content and not _MARKDOWN_TABLE_RE.search(rewritten):
+                # Rewrite succeeded — log and recurse so the rewritten content
+                # goes through the normal post/text decision path.
+                logger.info(
+                    "[Feishu] markdown-table-guard auto-rewrote table → kv-list "
+                    "(orig_len=%d, new_len=%d)",
+                    len(content),
+                    len(rewritten),
+                )
+                # Append a small footer so the LLM/operator knows it happened.
+                rewritten_with_footer = (
+                    rewritten
+                    + "\n\n_（小黑：检测到 md 表格语法，已自动改写为键值列表；下次直接用键值列表更稳。）_"
+                )
+                if _MARKDOWN_HINT_RE.search(rewritten_with_footer):
+                    return "post", _build_markdown_post_payload(rewritten_with_footer)
+                text_payload = {"text": rewritten_with_footer}
+                return "text", json.dumps(text_payload, ensure_ascii=False)
+            # Defense Line 2 fallback (added 2026-05-27): rewrite failed — log a
+            # WARNING so operators can grep, and append a self-check banner so
+            # both LLM (next turn) and user notice instead of silent degrade.
+            logger.warning(
+                "[Feishu] markdown-table-guard tripped — auto-rewrite failed, "
+                "force-degrading to plain text (len=%d, head=%r). LLM should "
+                "rewrite as key-value list next turn.",
+                len(content),
+                content[:120].replace("\n", "\\n"),
+            )
+            banner = (
+                "\n\n"
+                "⚠️ [小黑自检] 检测到 md 表格语法（飞书侧会显示原始 `|---|---|` 字面量），"
+                "下次请改用「**字段名**：值」键值列表格式。"
+            )
+            text_payload = {"text": content + banner}
             return "text", json.dumps(text_payload, ensure_ascii=False)
         if _MARKDOWN_HINT_RE.search(content):
             return "post", _build_markdown_post_payload(content)
